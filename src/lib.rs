@@ -13,7 +13,7 @@ use std::str;
 
 use bitflags::_core::str::from_utf8;
 
-use lopdf::{Document, Object, ObjectId, StringFormat};
+use lopdf::{Dictionary, Document, Error, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -135,18 +135,29 @@ impl Form {
         Self::load_doc(doc)
     }
 
-    fn load_doc(doc: Document) -> Result<Self, LoadError> {
+    fn load_doc(mut doc: Document) -> Result<Self, LoadError> {
         let mut form_ids = Vec::new();
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
-            // Get the form's top level fields
-            let catalog = doc.trailer.get(b"Root")?.deref(&doc)?.as_dict()?;
-            let acroform = catalog.get(b"AcroForm")?.deref(&doc)?.as_dict()?;
-            let fields_list = acroform
-                .get(b"Fields")?
-                //    .deref(&doc)?
-                .as_array()?;
+            let acroform = doc
+                .objects
+                .get_mut(
+                    &doc.trailer
+                        .get(b"Root")?
+                        .deref(&doc)?
+                        .as_dict()?
+                        .get(b"AcroForm")?
+                        .as_reference()?,
+                )
+                .ok_or(LoadError::NotAReference)?
+                .as_dict_mut()?;
+
+            // Sets the NeedAppearances option to true into "AcroForm" in order
+            // to render fields correctly
+            // acroform.set("NeedAppearances", Object::Boolean(true));
+
+            let fields_list = acroform.get(b"Fields")?.as_array()?;
             queue.append(&mut VecDeque::from(fields_list.clone()));
 
             // Iterate over the fields
@@ -424,7 +435,11 @@ impl Form {
                     .unwrap();
 
                 field.set("V", Object::String(s.into_bytes(), StringFormat::Literal));
-                field.remove(b"AP");
+
+                field.remove(b"I");
+
+                let ap = self.get_appearance();
+                // field.remove(b"AP");
 
                 Ok(())
             }
@@ -441,17 +456,6 @@ impl Form {
     pub fn set_check_box(&mut self, n: usize, is_checked: bool) -> Result<(), ValueError> {
         match self.get_state(n) {
             FieldState::CheckBox { .. } => {
-                let state = Object::Name(
-                    {
-                        if is_checked {
-                            "Yes"
-                        } else {
-                            "Off"
-                        }
-                    }
-                    .to_owned()
-                    .into_bytes(),
-                );
                 let field = self
                     .doc
                     .objects
@@ -459,6 +463,13 @@ impl Form {
                     .unwrap()
                     .as_dict_mut()
                     .unwrap();
+
+                let on = get_on_value(field);
+                let state = Object::Name(
+                    if is_checked { on.as_str() } else { "Off" }
+                        .to_owned()
+                        .into_bytes(),
+                );
 
                 field.set("V", state.clone());
                 field.set("AS", state);
@@ -592,6 +603,22 @@ impl Form {
     /// Saves the form to the specified path
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<(), io::Error> {
         self.doc.save_to(target)
+    }
+
+    fn get_appearance(&self) -> Result<Dictionary, Error> {
+        if let Ok(appearance) = self
+            .doc
+            .trailer
+            .get(b"Root")?
+            .deref(&self.doc)
+            .map_err(|_| Error::ObjectNotFound)?
+            .as_dict()?
+            .get(b"AP")
+        {
+            appearance.as_dict().map(|dict| dict.to_owned())
+        } else {
+            Err(Error::ObjectNotFound)
+        }
     }
 
     fn get_possibilities(&self, oid: ObjectId) -> Vec<String> {
