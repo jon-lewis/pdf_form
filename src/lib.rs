@@ -13,7 +13,8 @@ use std::str;
 
 use bitflags::_core::str::from_utf8;
 
-use lopdf::{Dictionary, Document, Error, Object, ObjectId, StringFormat};
+use lopdf::content::{Content, Operation};
+use lopdf::{Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -140,6 +141,8 @@ impl Form {
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
+            doc.decompress();
+
             let acroform = doc
                 .objects
                 .get_mut(
@@ -434,17 +437,146 @@ impl Form {
                     .as_dict_mut()
                     .unwrap();
 
-                field.set("V", Object::String(s.into_bytes(), StringFormat::Literal));
+                field.set("V", Object::string_literal(s.into_bytes()));
 
-                field.remove(b"I");
-
-                let ap = self.get_appearance();
-                // field.remove(b"AP");
+                // Regenerate text appearance confoming the new text but ignore the result
+                let _ = self.regenerate_text_appearance(n);
 
                 Ok(())
             }
             _ => Err(ValueError::TypeMismatch),
         }
+    }
+
+    /// Regenerates the appearance for the field at index `n` due to an alteration of the
+    /// original TextField value, the AP will be updated accordingly.
+    ///
+    /// # Incomplete
+    /// This function is not exhaustive as not parse the original TextField orientation
+    /// or the text alignment and other kind of enrichments, also doesn't discover for
+    /// the global document DA.
+    ///
+    /// A more sophisticated parser is needed here
+    fn regenerate_text_appearance(&mut self, n: usize) -> Result<(), lopdf::Error> {
+        let field = {
+            self.doc
+                .objects
+                .get(&self.form_ids[n])
+                .unwrap()
+                .as_dict()
+                .unwrap()
+        };
+
+        // The value of the object (should be a string)
+        let value = field.get(b"V")?.to_owned();
+
+        // The default appearance of the object (should be a string)
+        let da = field.get(b"DA")?.to_owned();
+
+        // The default appearance of the object (should be a string)
+        let rect = field
+            .get(b"Rect")?
+            .as_array()?
+            .iter()
+            .map(|object| {
+                object
+                    .as_f64()
+                    .unwrap_or(object.as_i64().unwrap_or(0) as f64)
+            })
+            .collect::<Vec<_>>();
+
+        // Gets the object stream
+        let object_id = field.get(b"AP")?.as_dict()?.get(b"N")?.as_reference()?;
+        let stream = self.doc.get_object_mut(object_id)?.as_stream_mut()?;
+
+        // Decode and get the content, even if is compressed
+        let mut content = {
+            if let Ok(content) = stream.decompressed_content() {
+                Content::decode(&content)?
+            } else {
+                Content::decode(&stream.content)?
+            }
+        };
+
+        // Ignored operators
+        let ignored_operators = vec![
+            "bt", "tc", "tw", "tz", "g", "tr", "tf", "tj", "et", "q", "bmc", "emc",
+        ];
+
+        // Remove these ignored operators as we have to generate the text and fonts again
+        content.operations.retain(|operation| {
+            !ignored_operators.contains(&operation.operator.to_lowercase().as_str())
+        });
+
+        // Let's construct the text widget
+        content.operations.append(&mut vec![
+            Operation::new("BMC", vec!["Tx".into()]),
+            Operation::new("q", vec![]),
+            Operation::new("BT", vec![]),
+        ]);
+
+        // The default font object (/Helv 12 Tf 0 g)
+        let default_font = ("Helv", 12, 0, "g");
+
+        // Build the font basing on the default appearance, if exists, if not,
+        // assume a default font (surely to be improved!)
+        let font = match da {
+            Object::String(ref bytes, _) => {
+                let values = from_utf8(bytes)?
+                    .trim_start_matches('/')
+                    .split(' ')
+                    .collect::<Vec<_>>();
+
+                if values.len() != 5 {
+                    default_font
+                } else {
+                    (
+                        values[0],
+                        values[1].parse::<i32>().unwrap_or(0),
+                        values[3].parse::<i32>().unwrap_or(0),
+                        values[4],
+                    )
+                }
+            }
+            _ => default_font,
+        };
+
+        // Define some helping font variables
+        let font_name = font.0;
+        let font_size = font.1;
+        let font_color = (font.2, font.3);
+
+        // Set the font type and size and color
+        content.operations.append(&mut vec![
+            Operation::new("Tf", vec![font_name.into(), font_size.into()]),
+            Operation::new(font_color.1, vec![font_color.0.into()]),
+        ]);
+
+        // Calcolate the text offset
+        let x = 3.0; // Suppose this fixed offset as we should have known the border here
+        let y = 0.5 * (rect[3] - rect[1]) - 0.4 * font_size as f64; // Formula picked up from Poppler
+
+        // Set the text bounds, first are fixed at "1 0 0 1" and then the calculated x,y
+        content.operations.append(&mut vec![Operation::new(
+            "Tm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+        )]);
+
+        // Set the text value and some finalizing operations
+        content.operations.append(&mut vec![
+            Operation::new("Tj", vec![value]),
+            Operation::new("ET", vec![]),
+            Operation::new("Q", vec![]),
+            Operation::new("EMC", vec![]),
+        ]);
+
+        // Set the new content to the original stream and compress it
+        if let Ok(encoded_content) = content.encode() {
+            stream.set_plain_content(encoded_content);
+            let _ = stream.compress();
+        }
+
+        Ok(())
     }
 
     /// If the field at index `n` is a checkbox field, toggles the check box based on the value
@@ -603,22 +735,6 @@ impl Form {
     /// Saves the form to the specified path
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<(), io::Error> {
         self.doc.save_to(target)
-    }
-
-    fn get_appearance(&self) -> Result<Dictionary, Error> {
-        if let Ok(appearance) = self
-            .doc
-            .trailer
-            .get(b"Root")?
-            .deref(&self.doc)
-            .map_err(|_| Error::ObjectNotFound)?
-            .as_dict()?
-            .get(b"AP")
-        {
-            appearance.as_dict().map(|dict| dict.to_owned())
-        } else {
-            Err(Error::ObjectNotFound)
-        }
     }
 
     fn get_possibilities(&self, oid: ObjectId) -> Vec<String> {
