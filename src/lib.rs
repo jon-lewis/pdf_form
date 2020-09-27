@@ -66,6 +66,7 @@ pub enum ValueError {
     /// Field not found
     NotFound,
 }
+
 /// The current state of a form field
 #[derive(Debug)]
 pub enum FieldState {
@@ -184,6 +185,23 @@ impl Form {
     /// Returns the number of fields the form has
     pub fn len(&self) -> usize {
         self.form_ids.len()
+    }
+
+    /// Gets the Acroform object id
+    pub fn get_form(&self) -> Option<ObjectId> {
+        if let Ok(root) = self.document.trailer.get(b"Root") {
+            if let Ok(catalog) = root.deref(&self.document) {
+                if let Ok(dict) = catalog.as_dict() {
+                    if let Ok(acroform) = dict.get(b"AcroForm") {
+                        if let Ok(form_id) = acroform.as_reference() {
+                            return Some(form_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Returns true if empty
