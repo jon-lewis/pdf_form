@@ -144,8 +144,6 @@ impl Form {
         let mut queue = VecDeque::new();
         // Block so borrow of doc ends before doc is moved into the result
         {
-            document.decompress();
-
             let acroform = document
                 .objects
                 .get_mut(
@@ -188,20 +186,15 @@ impl Form {
     }
 
     /// Gets the Acroform object id
-    pub fn get_form(&self) -> Option<ObjectId> {
-        if let Ok(root) = self.document.trailer.get(b"Root") {
-            if let Ok(catalog) = root.deref(&self.document) {
-                if let Ok(dict) = catalog.as_dict() {
-                    if let Ok(acroform) = dict.get(b"AcroForm") {
-                        if let Ok(form_id) = acroform.as_reference() {
-                            return Some(form_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+    pub fn get_form(&self) -> Result<ObjectId, lopdf::Error> {
+        self.document
+            .trailer
+            .get(b"Root")?
+            .deref(&self.document)
+            .map_err(|_| lopdf::Error::ObjectNotFound)?
+            .as_dict()?
+            .get(b"AcroForm")?
+            .as_reference()
     }
 
     /// Returns true if empty
